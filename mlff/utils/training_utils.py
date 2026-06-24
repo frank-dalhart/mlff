@@ -771,7 +771,7 @@ def fit(
                 )
 
             # Start validation process.
-            if step % eval_every_num_steps == 0:
+            if step % eval_every_num_steps == 0 and eval_every_num_steps:
                 iterator_validation = jraph.dynamically_batch(
                     validation_data,
                     n_node=batch_max_num_nodes,
