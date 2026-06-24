@@ -11,6 +11,7 @@ from flax import traverse_util
 from flax.core.frozen_dict import unfreeze
 from pathlib import Path
 from typing import Any, Callable, Dict, Sequence
+import pickle
 
 from ..utils import gradient_utils
 from ..utils import checkpoint_utils
@@ -266,7 +267,8 @@ property_to_loss = {
 
 
 def make_loss_fn(obs_fn: Callable, weights: Dict, scales: Dict = None, 
-                 use_robust_loss: bool = False, robust_loss_alpha: float = 1.99):
+                use_robust_loss: bool = False, robust_loss_alpha: float = 1.99
+                , fisher=None, theta_star=None, ewc_lambda: float = 0.0):
     # Targets are collected based on the loss weights.
     targets = list(weights.keys())
 
@@ -318,6 +320,15 @@ def make_loss_fn(obs_fn: Callable, weights: Dict, scales: Dict = None,
 
             loss += weights[target] * _l
             metrics.update({f'{target}_mse': _l / _scales[target].mean()})
+
+        if fisher is not None and theta_star is not None and ewc_lambda != 0.0:
+            sq = jax.tree_util.tree_map(
+                lambda p, ps, f: jnp.sum(f * (p - ps) ** 2),
+                params, theta_star, fisher,
+            )
+            ewc = 0.5 * ewc_lambda * jnp.sum(jnp.asarray(jax.tree_util.tree_leaves(sq)))
+            metrics.update({'ewc_penalty': ewc, 'task_loss': jnp.reshape(loss, ())})
+            loss = loss + ewc
 
         loss = jnp.reshape(loss, ())
         loss_mae = jnp.reshape(loss_mae, ())
@@ -449,23 +460,23 @@ def make_training_step_fn(
             params,
             batch
         )
+
         if log_gradient_values:
             metrics['grad_norm'] = unfreeze(jax.tree_util.tree_map(lambda x: jnp.linalg.norm(x.reshape(-1), axis=0), grads))
-        """
+
         updates, opt_state = optimizer.update(
             grads,
             opt_state,
             params
         )
-        
+
         params = optax.apply_updates(
             params=params,
             updates=updates
         )
-        """
-        
+
         metrics['grad_norm'] = optax.global_norm(grads)
-        metrics['grads'] = grads
+
         return params, opt_state, metrics
 
     return training_step_fn
@@ -614,9 +625,6 @@ def fit(
     step = 0
 
     opt_state = None
-    fisher = None
-    fisher_count = 0    
-    batch_count = 0
     for epoch in range(num_epochs):
         # Shuffle the training data.
         numpy_rng.shuffle(training_data)
@@ -628,7 +636,7 @@ def fit(
             n_graph=batch_max_num_graphs,
             n_pairs=batch_max_num_pairs,
         )
-        old_params = params
+
         # Start iteration over batched graphs.
         for graph_batch_training in iterator_training:
             batch_training = graph_to_batch_fn(graph_batch_training)
@@ -636,8 +644,7 @@ def fit(
             processed_nodes += batch_max_num_nodes - jraph.get_number_of_padding_with_graphs_nodes(graph_batch_training)
             # Training data is numpy arrays so we now transform them to jax.numpy arrays.
             batch_training = jax.tree_util.tree_map(jnp.array, batch_training)
-            print('batch number:',batch_count,'\n')
-            batch_count += 1
+
             # If params are None (in the first step), initialize the parameters or load from existing checkpoint.
             if params is None:
                 # Check if checkpoint already exists.
@@ -658,8 +665,7 @@ def fit(
                         print_param_shapes(params)
                         print("=" * 50)
                         print('This is fit_from_iterator function')
-                        
-                        #Modify parameters to handle theory levels
+                        # Modify parameters to handle theory levels
                         if 'params' in params and 'observables_0' in params['params']:
                             num_theory_levels = 16
                             # Modify energy_offset
@@ -731,8 +737,7 @@ def fit(
                                            f'training, set `allow_restart=True`.')
                 else:
                     params = model.init(jax_rng, batch_training)
-                old_params = params
-                
+
             # If optimizer state is None (in the first step), initialize from the parameter pyTree.
             if opt_state is None:
                 opt_state = optimizer.init(params)
@@ -742,24 +747,6 @@ def fit(
             assert opt_state is not None
 
             params, opt_state, train_metrics = training_step_fn(params, opt_state, batch_training)
-
-            #fisher
-            grads = train_metrics['grads']
-            if fisher is None:
-                fisher = jax.tree_util.tree_map(jnp.zeros_like, grads)
-            fisher = jax.tree_util.tree_map(lambda f, g: f + g ** 2, fisher, grads)   # square-then-sum
-
-            fisher_count += int(batch_training['num_of_non_padded_graphs'])
-            del train_metrics['grads']     # don't ship the big pytree to host at line 744
-            per_leaf = jax.tree_util.tree_map(lambda x, y: jnp.all(x == y), old_params, params)
-            is_same = jax.tree_util.tree_all(per_leaf)          # single Python bool
-            leaves = jax.tree_util.tree_leaves(fisher)
-            #print("fisher  sum =", sum(float(jnp.sum(x))  for x in leaves))
-            #print("fisher  min =", min(float(jnp.min(x))  for x in leaves))   # must be >= 0
-            #print("fisher  max =", max(float(jnp.max(x))  for x in leaves))
-            #print("fisher  nan =", sum(int(jnp.isnan(x).sum()) for x in leaves))   # must be 0
-            #print("num leaves  =", len(leaves))
-            #print("Are all params unchanged?:", is_same)
             step += 1
             train_metrics_np = jax.device_get(train_metrics)
 
@@ -814,13 +801,13 @@ def fit(
                 print(print_metrics(f"val_{epoch}_{step}:", eval_metrics))
 
                 # Save checkpoint.
-                #ckpt_mngr.save(
-                #    step,
-                #    args=ocp.args.Composite(params=ocp.args.StandardSave(params)),
-                #    metrics={
-                #        'loss': eval_metrics['eval_loss']
-                #    }
-                #)
+                ckpt_mngr.save(
+                    step,
+                    args=ocp.args.Composite(params=ocp.args.StandardSave(params)),
+                    metrics={
+                        'loss': eval_metrics['eval_loss']
+                    }
+                )
 
                 # Log to weights and bias.
                 if use_wandb:
@@ -829,13 +816,7 @@ def fit(
                         step=step
                     )
             # Finished validation process.
-    fisher = jax.tree_util.tree_map(lambda f: f / fisher_count, fisher)   # mean over samples
-    import pickle, os
-    with open(os.path.join(ckpt_dir, 'fisher.pkl'), 'wb') as fp:
-        pickle.dump(jax.device_get(fisher), fp)
-    with open(os.path.join(ckpt_dir, 'theta_star.pkl'), 'wb') as fp:
-        pickle.dump(jax.device_get(params), fp)   # the frozen weights the Fisher was measured at
-    print(f'Saved Fisher (N={fisher_count}) and theta* to {ckpt_dir}')
+
     # Wait until checkpoint manager completes all save operations.
     ckpt_mngr.wait_until_finished()
 
@@ -1057,7 +1038,7 @@ def fit_from_iterator(
             # Make sure parameters and opt_state are set.
             assert params is not None
             assert opt_state is not None
-            
+
             params, opt_state, train_metrics = training_step_fn(params, opt_state, batch_training)
             step += 1
             train_metrics_np = jax.device_get(train_metrics)
