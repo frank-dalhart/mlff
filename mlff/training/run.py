@@ -43,7 +43,7 @@ def train_step_fn(state: TrainState,
     Returns: Updated optimizer state and loss for current batch.
     """
     (loss, train_metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, batch)
-    state = state.apply_gradients(grads=grads)
+    #state = state.apply_gradients(grads=grads)
     train_metrics['gradients_norm'] = optax.global_norm(grads)
     return state, train_metrics, grads
 
@@ -203,9 +203,12 @@ def run_training(state: TrainState,
         if loss_fn_input is not None:
             loss_input_batch = jax.tree_util.tree_map(lambda y: y[perms[step_in_epoch], ...], loss_fn_input)
             train_batch = train_batch + loss_input_batch
+        old_params = state.params
         train_start = time.time()
         state, train_batch_metrics, grads = train_step_fn(state=state, batch=train_batch, loss_fn=loss_fn)
         train_end = time.time()
+        is_same = jax.tree_util.tree_map(lambda x, y: jnp.all(x == y), old_params, state.params)
+        print("Are layers unchanged?:", is_same)
 
         # check for NaN
         train_batch_metrics_np = jax.tree_util.tree_map(lambda x: np.array(x), train_batch_metrics)

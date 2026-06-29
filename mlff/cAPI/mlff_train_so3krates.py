@@ -23,7 +23,8 @@ from mlff.data import AseDataLoader
 from mlff.properties import md17_property_keys
 
 import mlff.properties.property_names as pn
-
+import sys
+print(sys.executable)
 # logging.basicConfig(level=logging.INFO)
 port = portpicker.pick_unused_port()
 jax.distributed.initialize(f'localhost:{port}', num_processes=1, process_id=0)
@@ -154,7 +155,7 @@ def train_so3krates():
     parser.add_argument('--eval_every_t', type=int, required=False, default=None,
                         help='Evaluate the model every t steps. Defaults to the number of steps that correspond to '
                              'evaluation after every epoch.')
-    parser.add_argument('--use_wandb', type=bool, required=False, default=True)
+    parser.add_argument('--use_wandb', type=bool, required=False, default=False)
 
     parser.add_argument('--wandb_init', action=StoreDictKeyPair, metavar="KEY1=VAL1,KEY2=VAL2...", default={})
 

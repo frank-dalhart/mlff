@@ -6,7 +6,6 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import wandb
-
 from flax import traverse_util
 from flax.core.frozen_dict import unfreeze
 from pathlib import Path
@@ -460,7 +459,7 @@ def make_training_step_fn(
             params,
             batch
         )
-
+        print(type(grads), optax.global_norm(grads)) 
         if log_gradient_values:
             metrics['grad_norm'] = unfreeze(jax.tree_util.tree_map(lambda x: jnp.linalg.norm(x.reshape(-1), axis=0), grads))
 
@@ -636,9 +635,13 @@ def fit(
             n_graph=batch_max_num_graphs,
             n_pairs=batch_max_num_pairs,
         )
-
+        epoch_metric_sums = {}      # running sum of each metric over the epoch
+        epoch_batches = 0
         # Start iteration over batched graphs.
         for graph_batch_training in iterator_training:
+            for k in ['dipole_vec', 'hirshfeld_ratios','stress']:
+                graph_batch_training.nodes.pop(k, None)     # hirshfeld_ratios lives in nodes
+                graph_batch_training.globals.pop(k, None)   # dipole_vec lives in globals
             batch_training = graph_to_batch_fn(graph_batch_training)
             processed_graphs += batch_training['num_of_non_padded_graphs']
             processed_nodes += batch_max_num_nodes - jraph.get_number_of_padding_with_graphs_nodes(graph_batch_training)
@@ -748,8 +751,13 @@ def fit(
 
             params, opt_state, train_metrics = training_step_fn(params, opt_state, batch_training)
             step += 1
-            train_metrics_np = jax.device_get(train_metrics)
-
+            # accumulate this batch's metrics
+            tm = jax.device_get(train_metrics)          # pull scalars to host
+            for k, v in tm.items():
+                if k == 'grads':                         # skip the grad pytree if present
+                    continue
+                epoch_metric_sums[k] = epoch_metric_sums.get(k, 0.0) + float(v)
+            epoch_batches += 1
             # Log training metrics.
             if use_wandb:
                 wandb.log(
@@ -816,6 +824,11 @@ def fit(
                         step=step
                     )
             # Finished validation process.
+        # ---- end of epoch: print mean training metrics ----
+        if epoch_batches > 0:
+            avg = {k: s / epoch_batches for k, s in epoch_metric_sums.items()}
+            msg = " | ".join(f"{k}={avg[k]:.6g}" for k in sorted(avg))
+            print(f"[epoch {epoch}] step {step} | {msg}", flush=True)
 
     # Wait until checkpoint manager completes all save operations.
     ckpt_mngr.wait_until_finished()

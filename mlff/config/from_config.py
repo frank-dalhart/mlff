@@ -17,7 +17,7 @@ from functools import partial, partialmethod
 import jax.numpy as jnp
 import jax
 import flax
-
+import pickle
 from ..utils import checkpoint_utils
 
 logging.MLFF = 35
@@ -194,7 +194,13 @@ def run_training(config: config_dict.ConfigDict, model: str = 'so3krates'):
         loader=loader,
         tf_record_present=tf_record_present
     )
-
+    g = training_data[0]
+    fields = {**g.nodes, **g.globals}
+    with config.unlocked():
+        for k in list(config.training.loss_weights.keys()):
+            if k in fields and bool(jnp.all(jnp.isnan(jnp.asarray(fields[k])))):
+                print(f"[loss] '{k}' is all-NaN in data — dropping from loss_weights")
+                del config.training.loss_weights[k]
     # If messages are normalized by the average number of neighbors, we need to calculate this quantity from the
     # training data or read it from the config when provided.
     if config.model.message_normalization == 'avg_num_neighbors':
@@ -228,12 +234,14 @@ def run_training(config: config_dict.ConfigDict, model: str = 'so3krates'):
         raise ValueError(
             f'{model=} is not a valid model.'
         )
-
+    fisher     = jax.tree_util.tree_map(jnp.asarray, pickle.load(open('/groups/torabifard/Jingxuan-Guo/so3lr/so3lr/params/checkpoints/fisher.pkl','rb')))
+    theta_star = jax.tree_util.tree_map(jnp.asarray, pickle.load(open('/groups/torabifard/Jingxuan-Guo/so3lr/so3lr/params/checkpoints/theta_star.pkl','rb')))
     loss_fn = training_utils.make_loss_fn(
         get_energy_and_force_fn_sparse(net),
         weights=config.training.loss_weights,
         use_robust_loss=config.training.get('use_robust_loss', False),
         robust_loss_alpha=config.training.get('robust_loss_alpha', 1.99),
+        fisher=fisher, theta_star=theta_star, ewc_lambda = 0 
     )
 
     val_fn = training_utils.make_val_fn(
@@ -1025,6 +1033,196 @@ def run_fine_tuning(
         )
     logging.mlff('Training has finished!')
 
+
+def compute_diagonal_fisher(
+        config: config_dict.ConfigDict,
+        num_data: int = None,
+        pick_idx=None,
+        on_split: str = 'training',
+        targets: Sequence[str] = None,
+        estimator: str = 'fisher',         # 'fisher' (squared-grad) or 'hessian' (Hutchinson)
+        sigma: dict = None,                # per-target noise std, e.g. {'energy': 1.0, 'forces': 1.0}
+        empirical: bool = True,            # empirical Fisher (uses targets) vs. true Fisher
+        num_hutchinson: int = 16,
+        hessian_clamp: str = 'clamp',      # 'clamp' or 'abs' (only for estimator='hessian')
+        seed: int = 0,
+        save_to: str = None,
+):
+    """Compute the diagonal Fisher (or Hessian) of the loss w.r.t. params on a dataset.
+
+    Returns a PyTree matching the model params, suitable as the EWC importance F.
+    """
+    model = config.model.get('model', 'so3krates')
+
+    energy_unit = energy_unit_from_config(config=config)
+    length_unit = length_unit_from_config(config=config)
+    dipole_vec_unit = dipole_vec_unit_from_config(config=config)
+
+    if targets is None:
+        targets = list(config.training.loss_weights.keys())
+    if sigma is None:
+        sigma = {t: 1.0 for t in targets}
+
+    # --- load data exactly like run_evaluation ---
+    loader, tf_record_present = data_loader_from_config(config=config)
+
+    if not tf_record_present:
+        eval_data, data_stats = loader.load(
+            cutoff=config.model.cutoff / length_unit,
+            cutoff_lr=config.data.neighbors_lr_cutoff / length_unit if config.data.neighbors_lr_bool else None,
+            calculate_neighbors_lr=config.data.neighbors_lr_bool,
+            pick_idx=pick_idx,
+        )
+        data_for_fisher = data.transformations.subtract_atomic_energy_shifts(
+            data.transformations.unit_conversion(
+                eval_data[:num_data] if num_data is not None else eval_data,
+                energy_unit=energy_unit,
+                length_unit=length_unit,
+                dipole_vec_unit=dipole_vec_unit,
+            ),
+            atomic_energy_shifts={int(k): v for (k, v) in config.data.energy_shifts.items()},
+        )
+    else:
+        # TFRecord path: mirror the on_split selection from run_evaluation
+        raise NotImplementedError(
+            'Fisher on TFRecord datasets: follow the same on_split branch as run_evaluation.'
+        )
+
+    # --- restore params from checkpoint (these are theta_star) ---
+    ckpt_dir = (Path(config.workdir) / 'checkpoints').expanduser().resolve()
+    logging.mlff(f'Restore parameters (theta*) from {ckpt_dir} ...')
+    params = checkpoint_utils.load_params_from_checkpoint(ckpt_dir=ckpt_dir)
+
+    # --- build model + energy/force fn ---
+    if model == 'so3krates':
+        net = make_so3krates_sparse_from_config(config)
+    elif model == 'itp_net':
+        net = make_itp_net_from_config(config)
+    else:
+        raise ValueError(f'{model=} is not a valid model.')
+
+    ef = get_energy_and_force_fn_sparse(net)
+
+    def per_graph_energy(p, inputs):
+        # energy_fn returns (-sum(energy), energy); take the per-graph vector
+        _, energy = ef.energy_fn(p, **inputs)
+        return energy  # (num_graphs,)
+
+    def model_forces(p, inputs):
+        # forces = -dE/dpositions
+        (_, _), neg_grad = jax.value_and_grad(
+            lambda pp, pos: ef.energy_fn(pp, **{**inputs, 'positions': pos}),
+            argnums=1, has_aux=True,
+        )(p, inputs['positions'])
+        return -neg_grad  # (num_nodes, 3)
+
+    # --- per-batch loss used by the Hessian estimator (match your training loss!) ---
+    def scalar_loss(p, inputs, graph_mask, node_mask):
+        loss = 0.0
+        if 'energy' in targets:
+            e_pred = per_graph_energy(p, inputs)
+            w = config.training.loss_weights['energy'] / (sigma['energy'] ** 2)
+            sq = (e_pred - inputs['energy']) ** 2 * graph_mask
+            loss = loss + 0.5 * w * jnp.sum(sq) / jnp.maximum(jnp.sum(graph_mask), 1.0)
+        if 'forces' in targets:
+            f_pred = model_forces(p, inputs)
+            w = config.training.loss_weights['forces'] / (sigma['forces'] ** 2)
+            nm = node_mask[:, None]
+            sq = ((f_pred - inputs['forces']) ** 2) * nm
+            loss = loss + 0.5 * w * jnp.sum(sq) / jnp.maximum(jnp.sum(node_mask) * 3.0, 1.0)
+        return loss
+
+    # ---- estimator 1: squared-gradient (empirical) Fisher, energy term ----
+    @jax.jit
+    def batch_fisher(p, inputs, graph_mask):
+        J = jax.jacrev(lambda pp: per_graph_energy(pp, inputs))(p)  # leaves: (num_graphs, *shape)
+        e_pred = per_graph_energy(p, inputs)
+        if empirical:
+            resid = (e_pred - inputs['energy']) / (sigma['energy'] ** 2)
+            weight = resid * graph_mask
+        else:
+            weight = graph_mask / sigma['energy']
+        w2 = weight ** 2
+
+        def contract(leaf):
+            ww = w2.reshape((-1,) + (1,) * (leaf.ndim - 1))
+            return jnp.sum(ww * leaf ** 2, axis=0)
+
+        return jax.tree_util.tree_map(contract, J)
+
+    # ---- estimator 2: Hutchinson Hessian diagonal ----
+    def hvp(p, inputs, graph_mask, node_mask, v):
+        g = lambda pp: jax.grad(scalar_loss)(pp, inputs, graph_mask, node_mask)
+        return jax.jvp(g, (p,), (v,))[1]
+
+    @partial(jax.jit, static_argnums=())
+    def batch_hessian(p, inputs, graph_mask, node_mask, key):
+        leaves, treedef = jax.tree_util.tree_flatten(p)
+        acc = [jnp.zeros_like(l) for l in leaves]
+        keys = jax.random.split(key, num_hutchinson)
+        for k in keys:
+            sks = jax.random.split(k, len(leaves))
+            v_leaves = [jax.random.rademacher(sk, shape=l.shape).astype(l.dtype)
+                        for sk, l in zip(sks, leaves)]
+            v = jax.tree_util.tree_unflatten(treedef, v_leaves)
+            Hv = hvp(p, inputs, graph_mask, node_mask, v)
+            Hv_leaves = jax.tree_util.tree_leaves(Hv)
+            acc = [a + vi * hvi for a, vi, hvi in zip(acc, v_leaves, Hv_leaves)]
+        acc = [a / num_hutchinson for a in acc]
+        return jax.tree_util.tree_unflatten(treedef, acc)
+
+    # --- iterate batches exactly like evaluation_utils.evaluate ---
+    iterator = jraph.dynamically_batch(
+        iter(data_for_fisher),
+        n_node=config.training.batch_max_num_nodes,
+        n_edge=config.training.batch_max_num_edges,
+        n_graph=config.training.batch_max_num_graphs,
+        n_pairs=config.training.batch_max_num_pairs,
+    )
+
+    F = jax.tree_util.tree_map(jnp.zeros_like, params)
+    n_total = 0.0
+    key = jax.random.PRNGKey(seed)
+
+    for graph_batch in tqdm(iterator):
+        batch = jraph_utils.graph_to_batch_fn(graph_batch)
+        batch = jax.tree_util.tree_map(jnp.array, batch)
+        graph_mask = batch['graph_mask'].astype(jnp.float32)
+        node_mask = batch['node_mask'].astype(jnp.float32)
+        inputs = {k: v for (k, v) in batch.items() if k not in targets}
+        # keep targets accessible inside the loss/fisher fns:
+        for t in targets:
+            inputs.setdefault(t, batch.get(t))
+
+        if estimator == 'fisher':
+            contrib = batch_fisher(params, inputs, graph_mask)
+        elif estimator == 'hessian':
+            key, sub = jax.random.split(key)
+            contrib = batch_hessian(params, inputs, graph_mask, node_mask, sub)
+        else:
+            raise ValueError(f'Unknown estimator {estimator!r}.')
+
+        F = jax.tree_util.tree_map(lambda a, c: a + c, F, contrib)
+        n_total += float(jnp.sum(graph_mask))
+
+    F = jax.tree_util.tree_map(lambda a: a / max(n_total, 1.0), F)
+
+    if estimator == 'hessian':
+        if hessian_clamp == 'clamp':
+            F = jax.tree_util.tree_map(lambda a: jnp.clip(a, a_min=0.0), F)
+        elif hessian_clamp == 'abs':
+            F = jax.tree_util.tree_map(jnp.abs, F)
+
+    if save_to is not None:
+        save_path = Path(save_to).expanduser().resolve()
+        with open(save_path, 'wb') as fp:
+            pickle.dump({'fisher': jax.device_get(F),
+                         'theta_star': jax.device_get(params),
+                         'estimator': estimator,
+                         'targets': list(targets)}, fp)
+        logging.mlff(f'Saved Fisher + theta* to {save_path}')
+
+    return F
 
 def data_loader_from_config(config):
     """Create a data loader from config.
