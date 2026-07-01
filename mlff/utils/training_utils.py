@@ -11,7 +11,8 @@ from flax.core.frozen_dict import unfreeze
 from pathlib import Path
 from typing import Any, Callable, Dict, Sequence
 import pickle
-
+import os
+print(os.environ.get('JAX_ENABLE_X64'))
 from ..utils import gradient_utils
 from ..utils import checkpoint_utils
 
@@ -319,7 +320,7 @@ def make_loss_fn(obs_fn: Callable, weights: Dict, scales: Dict = None,
 
             loss += weights[target] * _l
             metrics.update({f'{target}_mse': _l / _scales[target].mean()})
-
+        
         if fisher is not None and theta_star is not None and ewc_lambda != 0.0:
             sq = jax.tree_util.tree_map(
                 lambda p, ps, f: jnp.sum(f * (p - ps) ** 2),
@@ -333,7 +334,8 @@ def make_loss_fn(obs_fn: Callable, weights: Dict, scales: Dict = None,
         loss_mae = jnp.reshape(loss_mae, ())
         metrics.update({'loss': loss})
         metrics.update({'loss_mae': loss_mae})
-
+        
+        
         return loss, metrics
 
     return loss_fn
@@ -459,7 +461,7 @@ def make_training_step_fn(
             params,
             batch
         )
-        print(type(grads), optax.global_norm(grads)) 
+        #print(type(grads), optax.global_norm(grads)) 
         if log_gradient_values:
             metrics['grad_norm'] = unfreeze(jax.tree_util.tree_map(lambda x: jnp.linalg.norm(x.reshape(-1), axis=0), grads))
 
@@ -639,9 +641,14 @@ def fit(
         epoch_batches = 0
         # Start iteration over batched graphs.
         for graph_batch_training in iterator_training:
-            for k in ['dipole_vec', 'hirshfeld_ratios','stress']:
+            keys_to_pop = ['stress']  # always popped
+            if graph_batch_training.globals['dipole_vec'] is None:
+                keys_to_pop.append('dipole_vec')
+            if graph_batch_training.nodes['hirshfeld_ratios'] is None:
+                keys_to_pop.append('hirshfeld_ratios')
+            for k in keys_to_pop:
                 graph_batch_training.nodes.pop(k, None)     # hirshfeld_ratios lives in nodes
-                graph_batch_training.globals.pop(k, None)   # dipole_vec lives in globals
+                graph_batch_training.globals.pop(k, None)
             batch_training = graph_to_batch_fn(graph_batch_training)
             processed_graphs += batch_training['num_of_non_padded_graphs']
             processed_nodes += batch_max_num_nodes - jraph.get_number_of_padding_with_graphs_nodes(graph_batch_training)

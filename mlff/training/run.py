@@ -43,7 +43,7 @@ def train_step_fn(state: TrainState,
     Returns: Updated optimizer state and loss for current batch.
     """
     (loss, train_metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, batch)
-    #state = state.apply_gradients(grads=grads)
+    state = state.apply_gradients(grads=grads)
     train_metrics['gradients_norm'] = optax.global_norm(grads)
     return state, train_metrics, grads
 
