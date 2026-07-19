@@ -13,6 +13,13 @@ DataTupleT = Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]]
 Derivative = Tuple[str, Tuple[str, str, Callable]]
 ObservableFn = Callable[[FrozenDict, Dict[str, Array]], Dict[str, Array]]
 
+def breakpoint_if_nonfinite(x):
+  is_finite = jnp.isfinite(x).all()
+  def true_fn(x):
+    pass
+  def false_fn(x):
+    jax.debug.breakpoint()
+  jax.lax.cond(is_finite,false_fn ,true_fn, x)
 
 def get_observable_fn_sparse(model: StackNetSparse, observable: str = None):
     """
@@ -194,8 +201,15 @@ def get_energy_and_force_fn_sparse(model: StackNetSparse):
                       residue_segments=residue_segments,
                       residue_charge=residue_charge,
                       )
-
+        
+        out, state = model.apply(params, inputs, capture_intermediates=True)  # (num_graphs)
+        intermediates = state['intermediates']
+        energy = out['energy']
+        fin = jax.tree_util.tree_map(lambda xs: jnp.all(jnp.isfinite(xs)), intermediates)
+        breakpoint_if_nonfinite(jnp.stack(jax.tree_util.tree_leaves(fin)))
         energy = model.apply(params, inputs)['energy']  # (num_graphs)
+        jax.debug.breakpoint()
+        jax.debug.breakpoint()
         energy = safe_scale(energy, graph_mask)
         return -jnp.sum(energy), energy  # (), (num_graphs)
 
@@ -224,6 +238,7 @@ def get_energy_and_force_fn_sparse(model: StackNetSparse):
             *args,
             **kwargs
     ):
+        jax.debug.breakpoint()
         (_, energy), forces = jax.value_and_grad(
             energy_fn,
             argnums=1,

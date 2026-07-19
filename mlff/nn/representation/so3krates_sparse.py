@@ -170,4 +170,5 @@ def init_so3krates_sparse(
         observables=[energy, dipole_vec, hirshfeld_ratios],
         return_representations_bool=return_representations_bool,
         prop_keys=None
+
     )

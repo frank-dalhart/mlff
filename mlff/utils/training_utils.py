@@ -268,7 +268,7 @@ property_to_loss = {
 
 def make_loss_fn(obs_fn: Callable, weights: Dict, scales: Dict = None, 
                 use_robust_loss: bool = False, robust_loss_alpha: float = 1.99
-                , fisher=None, theta_star=None, ewc_lambda: float = 0.0):
+                , fisher=None, theta_star=None, ewc_lambda: float = 5.0):
     # Targets are collected based on the loss weights.
     targets = list(weights.keys())
 
@@ -280,6 +280,7 @@ def make_loss_fn(obs_fn: Callable, weights: Dict, scales: Dict = None,
     @jax.jit
     def loss_fn(params, batch: Dict[str, jnp.ndarray]):
         # Everything that is not a target is a input.
+        jax.debug.breakpoint()
         inputs = {k: v for k, v in batch.items() if k not in targets}
 
         # Collect the targets.
@@ -320,8 +321,8 @@ def make_loss_fn(obs_fn: Callable, weights: Dict, scales: Dict = None,
 
             loss += weights[target] * _l
             metrics.update({f'{target}_mse': _l / _scales[target].mean()})
-        
-        if fisher is not None and theta_star is not None and ewc_lambda != 0.0:
+
+        if fisher is not None and theta_star is not None:
             sq = jax.tree_util.tree_map(
                 lambda p, ps, f: jnp.sum(f * (p - ps) ** 2),
                 params, theta_star, fisher,
@@ -329,7 +330,6 @@ def make_loss_fn(obs_fn: Callable, weights: Dict, scales: Dict = None,
             ewc = 0.5 * ewc_lambda * jnp.sum(jnp.asarray(jax.tree_util.tree_leaves(sq)))
             metrics.update({'ewc_penalty': ewc, 'task_loss': jnp.reshape(loss, ())})
             loss = loss + ewc
-
         loss = jnp.reshape(loss, ())
         loss_mae = jnp.reshape(loss_mae, ())
         metrics.update({'loss': loss})
@@ -454,6 +454,8 @@ def make_training_step_fn(
             Updated state and metrics.
 
         """
+        jax.debug.breakpoint()
+        jax.debug.print("it works!!")
         (loss, metrics), grads = jax.value_and_grad(
             loss_fn,
             has_aux=True
@@ -755,7 +757,6 @@ def fit(
             # Make sure parameters and opt_state are set.
             assert params is not None
             assert opt_state is not None
-
             params, opt_state, train_metrics = training_step_fn(params, opt_state, batch_training)
             step += 1
             # accumulate this batch's metrics
